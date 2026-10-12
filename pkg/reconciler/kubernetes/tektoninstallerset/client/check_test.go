@@ -115,7 +115,8 @@ func TestInstallerSetClient_Check(t *testing.T) {
 			wantErr: ErrInvalidState,
 		},
 		{
-			name:    "main installer set version different error",
+			// ponytail: with in-place upgrades, version mismatch returns ErrUpdateRequired
+			name:    "main installer set version different triggers update",
 			setType: InstallerTypeMain,
 			resources: &v1alpha1.TektonInstallerSetList{
 				Items: []v1alpha1.TektonInstallerSet{
@@ -157,7 +158,7 @@ func TestInstallerSetClient_Check(t *testing.T) {
 					},
 				},
 			},
-			wantErr: ErrVersionDifferent,
+			wantErr: ErrUpdateRequired,
 		},
 		{
 			name:    "pre set with different namespace error",

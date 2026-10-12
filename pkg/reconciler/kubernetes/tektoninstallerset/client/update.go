@@ -94,8 +94,22 @@ func (i *InstallerSetClient) updateSet(ctx context.Context, comp v1alpha1.Tekton
 		}
 
 		current := onCluster.GetAnnotations()
+		if current == nil {
+			current = map[string]string{}
+		}
 		current[v1alpha1.LastAppliedHashKey] = specHash
+		current[v1alpha1.TargetNamespaceKey] = comp.GetSpec().GetTargetNamespace()
 		onCluster.SetAnnotations(current)
+
+		// ponytail: update version label so next reconcile doesn't see a mismatch
+		labels := onCluster.GetLabels()
+		if labels == nil {
+			labels = map[string]string{}
+		}
+		if labels[v1alpha1.ReleaseVersionKey] != i.releaseVersion {
+			labels[v1alpha1.ReleaseVersionKey] = i.releaseVersion
+			onCluster.SetLabels(labels)
+		}
 
 		onCluster.Spec.Manifests = manifest.Resources()
 

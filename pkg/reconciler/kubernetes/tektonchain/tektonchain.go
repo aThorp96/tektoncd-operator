@@ -197,25 +197,9 @@ func (r *Reconciler) ReconcileKind(ctx context.Context, tc *v1alpha1.TektonChain
 			return err
 		}
 
+		// ponytail: version mismatch handled by in-place update at the main IS block below
 		if rv := installedTIS.Labels[v1alpha1.ReleaseVersionKey]; rv != r.operatorVersion {
-			logger.Infow("Deleting outdated InstallerSet", "name", existingChainInstallerSet, "currentVersion", rv, "expectedVersion", r.operatorVersion)
-			err := r.operatorClientSet.OperatorV1alpha1().TektonInstallerSets().
-				Delete(ctx, existingChainInstallerSet, metav1.DeleteOptions{})
-			if err != nil {
-				logger.Errorw("Failed to delete outdated InstallerSet", "error", err)
-				return err
-			}
-
-			if _, err := r.operatorClientSet.OperatorV1alpha1().TektonInstallerSets().Get(ctx, existingChainInstallerSet, metav1.GetOptions{}); err == nil {
-				tc.Status.MarkNotReady("Waiting for previous installer set to get deleted")
-				logger.Debugw("InstallerSet deletion pending", "name", existingChainInstallerSet)
-				return v1alpha1.REQUEUE_EVENT_AFTER
-			} else if !apierrors.IsNotFound(err) {
-				logger.Errorw("Error confirming InstallerSet deletion", "error", err)
-				return err
-			}
-			logger.Infow("Outdated InstallerSet successfully deleted")
-			return nil
+			logger.Infow("Version changed, will update in place", "name", existingChainInstallerSet, "currentVersion", rv, "expectedVersion", r.operatorVersion)
 		}
 	}
 
@@ -270,14 +254,12 @@ func (r *Reconciler) ReconcileKind(ctx context.Context, tc *v1alpha1.TektonChain
 	// If any of the above things is not same then delete the existing Tekton Chain InstallerSet
 	// and create a new with expected properties
 
-	if configInstallerSetTargetNamespace != tc.Spec.TargetNamespace || configInstallerSetReleaseVersion != r.operatorVersion {
-		logger.Infow("Config InstallerSet needs update",
+	// ponytail: namespace change still requires delete+recreate; version-only change updates in place
+	if configInstallerSetTargetNamespace != tc.Spec.TargetNamespace {
+		logger.Infow("Config InstallerSet namespace changed, deleting",
 			"name", existingConfigInstallerSet,
 			"currentNamespace", configInstallerSetTargetNamespace,
-			"expectedNamespace", tc.Spec.TargetNamespace,
-			"currentVersion", configInstallerSetReleaseVersion,
-			"expectedVersion", r.operatorVersion)
-		// Delete the existing Tekton Chain InstallerSet
+			"expectedNamespace", tc.Spec.TargetNamespace)
 		err := r.operatorClientSet.OperatorV1alpha1().TektonInstallerSets().
 			Delete(ctx, existingConfigInstallerSet, metav1.DeleteOptions{})
 		if err != nil {
@@ -285,7 +267,6 @@ func (r *Reconciler) ReconcileKind(ctx context.Context, tc *v1alpha1.TektonChain
 			return err
 		}
 
-		// Make sure the Tekton Chain Config InstallerSet is deleted
 		_, err = r.operatorClientSet.OperatorV1alpha1().TektonInstallerSets().
 			Get(ctx, existingConfigInstallerSet, metav1.GetOptions{})
 		if err == nil {
@@ -298,6 +279,31 @@ func (r *Reconciler) ReconcileKind(ctx context.Context, tc *v1alpha1.TektonChain
 			return err
 		}
 		return nil
+
+	} else if configInstallerSetReleaseVersion != r.operatorVersion {
+		logger.Infow("Config InstallerSet version changed, updating in place",
+			"name", existingConfigInstallerSet,
+			"currentVersion", configInstallerSetReleaseVersion,
+			"expectedVersion", r.operatorVersion)
+		labels := installedConfigTIS.GetLabels()
+		labels[v1alpha1.ReleaseVersionKey] = r.operatorVersion
+		installedConfigTIS.SetLabels(labels)
+
+		configManifest := r.manifest.Filter(mf.ByKind("ConfigMap"), mf.ByName("chains-config"))
+		transformer := filterAndTransform(r.extension)
+		if _, err := transformer(ctx, &configManifest, tc); err != nil {
+			logger.Errorw("Config manifest transformation failed", "error", err)
+			return err
+		}
+		installedConfigTIS.Spec.Manifests = configManifest.Resources()
+
+		if _, err = r.operatorClientSet.OperatorV1alpha1().TektonInstallerSets().
+			Update(ctx, installedConfigTIS, metav1.UpdateOptions{}); err != nil {
+			logger.Errorw("Failed to update Config InstallerSet", "name", installedConfigTIS.Name, "error", err)
+			return err
+		}
+		logger.Infow("Config InstallerSet updated in place", "name", installedConfigTIS.Name)
+		return v1alpha1.REQUEUE_EVENT_AFTER
 
 	} else {
 		// If target namespace and version are not changed then check if Chain
@@ -395,19 +401,12 @@ func (r *Reconciler) ReconcileKind(ctx context.Context, tc *v1alpha1.TektonChain
 	installerSetTargetNamespace := installedTIS.Annotations[v1alpha1.TargetNamespaceKey]
 	installerSetReleaseVersion := installedTIS.Labels[v1alpha1.ReleaseVersionKey]
 
-	// Check if TargetNamespace of existing Tekton Chain InstallerSet is same as expected
-	// Check if Release Version in Tekton Chain InstallerSet is same as expected
-	// If any of the above things is not same then delete the existing Tekton Chain InstallerSet
-	// and create a new with expected properties
-
-	if installerSetTargetNamespace != tc.Spec.TargetNamespace || installerSetReleaseVersion != r.operatorVersion {
-		logger.Infow("InstallerSet needs update",
+	// ponytail: namespace change still requires delete+recreate
+	if installerSetTargetNamespace != tc.Spec.TargetNamespace {
+		logger.Infow("InstallerSet namespace changed, deleting",
 			"name", existingInstallerSet,
 			"currentNamespace", installerSetTargetNamespace,
-			"expectedNamespace", tc.Spec.TargetNamespace,
-			"currentVersion", installerSetReleaseVersion,
-			"expectedVersion", r.operatorVersion)
-		// Delete the existing Tekton Chain InstallerSet
+			"expectedNamespace", tc.Spec.TargetNamespace)
 		err := r.operatorClientSet.OperatorV1alpha1().TektonInstallerSets().
 			Delete(ctx, existingInstallerSet, metav1.DeleteOptions{})
 		if err != nil {
@@ -415,7 +414,6 @@ func (r *Reconciler) ReconcileKind(ctx context.Context, tc *v1alpha1.TektonChain
 			return err
 		}
 
-		// Make sure the Tekton Chain InstallerSet is deleted
 		_, err = r.operatorClientSet.OperatorV1alpha1().TektonInstallerSets().
 			Get(ctx, existingInstallerSet, metav1.GetOptions{})
 		if err == nil {
@@ -429,15 +427,12 @@ func (r *Reconciler) ReconcileKind(ctx context.Context, tc *v1alpha1.TektonChain
 		}
 		logger.Infow("InstallerSet successfully deleted", "name", existingInstallerSet)
 		return nil
+	}
 
-	} else {
-		// If target namespace and version are not changed then check if Chain
-		// spec is changed by checking hash stored as annotation on
-		// Tekton Chain InstallerSet with computing new hash of TektonChain Spec
+	// ponytail: version change or spec change — update in place
+	{
+		needsUpdate := false
 
-		// Hash of TektonChain Spec plus platform-data-hash annotation so that
-		// changes driven by TektonConfig (e.g. enableMetricsMTLS) re-apply
-		// extension transformers even when the spec itself hasn't changed.
 		expectedSpecHash, err := hash.Compute(struct {
 			Spec             v1alpha1.TektonChainSpec
 			PlatformDataHash string
@@ -450,29 +445,37 @@ func (r *Reconciler) ReconcileKind(ctx context.Context, tc *v1alpha1.TektonChain
 			return err
 		}
 
-		// spec hash stored on main installerSet
 		lastAppliedHash := installedTIS.GetAnnotations()[v1alpha1.LastAppliedHashKey]
+
+		if installerSetReleaseVersion != r.operatorVersion {
+			logger.Infow("Version changed, updating InstallerSet in place",
+				"name", installedTIS.Name,
+				"currentVersion", installerSetReleaseVersion,
+				"expectedVersion", r.operatorVersion)
+			labels := installedTIS.GetLabels()
+			labels[v1alpha1.ReleaseVersionKey] = r.operatorVersion
+			installedTIS.SetLabels(labels)
+			needsUpdate = true
+		}
 
 		if lastAppliedHash != expectedSpecHash {
 			logger.Infow("Spec changed, updating InstallerSet",
 				"name", installedTIS.Name,
 				"oldHash", lastAppliedHash,
 				"newHash", expectedSpecHash)
+			needsUpdate = true
+		}
+
+		if needsUpdate {
 			manifest := r.manifest
-			// installerSet adds it's owner as namespace's owner
-			// so deleting tekton chain deletes target namespace too
-			// to skip it we filter out namespace if pipeline have same namespace
 			pipelineNamespace, err := common.PipelineTargetNamspace(r.pipelineInformer)
 			if err != nil {
 				logger.Errorw("Failed to fetch pipeline namespace", "error", err)
 				return err
 			}
 			if tc.Spec.GetTargetNamespace() == pipelineNamespace {
-				logger.Debugw("Filtering out namespace resource as it's shared with pipeline",
-					"namespace", pipelineNamespace)
 				manifest = manifest.Filter(mf.Not(mf.ByKind("Namespace")))
 			}
-			// remove secret and `chains-config` configMap from this installerset as this installerset will be deleted on upgrade
 			manifest = manifest.Filter(mf.Not(mf.ByKind("Secret")),
 				mf.Not(mf.All(mf.ByName("chains-config"), mf.ByKind("ConfigMap"))))
 
@@ -482,12 +485,12 @@ func (r *Reconciler) ReconcileKind(ctx context.Context, tc *v1alpha1.TektonChain
 				return err
 			}
 
-			// Update the spec hash
 			current := installedTIS.GetAnnotations()
+			if current == nil {
+				current = map[string]string{}
+			}
 			current[v1alpha1.LastAppliedHashKey] = expectedSpecHash
 			installedTIS.SetAnnotations(current)
-
-			// Update the manifests
 			installedTIS.Spec.Manifests = manifest.Resources()
 
 			if _, err = r.operatorClientSet.OperatorV1alpha1().TektonInstallerSets().
@@ -495,9 +498,6 @@ func (r *Reconciler) ReconcileKind(ctx context.Context, tc *v1alpha1.TektonChain
 				logger.Errorw("Failed to update InstallerSet", "name", installedTIS.Name, "error", err)
 				return err
 			}
-
-			// after updating installer set enqueue after a duration
-			// to allow changes to get deployed
 			logger.Infow("InstallerSet successfully updated", "name", installedTIS.Name)
 			return v1alpha1.REQUEUE_EVENT_AFTER
 		}

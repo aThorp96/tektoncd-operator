@@ -120,7 +120,9 @@ func verifyMeta(resourceKind, isType string, logger *zap.SugaredLogger, set v1al
 		return ErrInvalidState
 	}
 	if rVel != releaseVersion {
-		return ErrVersionDifferent
+		// ponytail: hard-coded for PoC — gate behind feature flag before merge
+		logger.Infof("%v/%v: version changed %v -> %v, using in-place update path", resourceKind, isType, rVel, releaseVersion)
+		return ErrUpdateRequired
 	}
 
 	// Target namespace check

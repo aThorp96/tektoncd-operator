@@ -299,30 +299,21 @@ func (r *Reconciler) ReconcileKind(ctx context.Context, tr *v1alpha1.TektonResul
 	installerSetTargetNamespace := installedTIS.Annotations[v1alpha1.TargetNamespaceKey]
 	installerSetReleaseVersion := installedTIS.Labels[v1alpha1.ReleaseVersionKey]
 
-	// Check if TargetNamespace of existing TektonInstallerSet is same as expected
-	// Check if Release Version in TektonInstallerSet is same as expected
-	// If any of the thing above is not same then delete the existing TektonInstallerSet
-	// and create a new with expected properties
-	if installerSetTargetNamespace != tr.Spec.TargetNamespace || installerSetReleaseVersion != r.operatorVersion {
-		logger.Infow("Configuration changed, deleting existing installer set",
+	// ponytail: namespace change still requires delete+recreate
+	if installerSetTargetNamespace != tr.Spec.TargetNamespace {
+		logger.Infow("Namespace changed, deleting existing installer set",
 			"existingNamespace", installerSetTargetNamespace,
-			"newNamespace", tr.Spec.TargetNamespace,
-			"existingVersion", installerSetReleaseVersion,
-			"newVersion", r.operatorVersion)
-		// Delete the existing TektonInstallerSet
+			"newNamespace", tr.Spec.TargetNamespace)
 		err := r.operatorClientSet.OperatorV1alpha1().TektonInstallerSets().
 			Delete(ctx, existingInstallerSet, metav1.DeleteOptions{})
 		if err != nil {
 			logger.Errorw("Failed to delete installer set", "name", existingInstallerSet, "error", err)
 			return err
 		}
-		logger.Infow("Successfully deleted installer set", "name", existingInstallerSet)
 
-		// Make sure the TektonInstallerSet is deleted
 		_, err = r.operatorClientSet.OperatorV1alpha1().TektonInstallerSets().
 			Get(ctx, existingInstallerSet, metav1.GetOptions{})
 		if err == nil {
-			logger.Infow("Waiting for previous installer set to be deleted", "name", existingInstallerSet)
 			tr.Status.MarkNotReady("Waiting for previous installer set to get deleted")
 			return v1alpha1.REQUEUE_EVENT_AFTER
 		}
@@ -330,15 +321,13 @@ func (r *Reconciler) ReconcileKind(ctx context.Context, tr *v1alpha1.TektonResul
 			logger.Errorw("Failed to verify installer set deletion", "name", existingInstallerSet, "error", err)
 			return err
 		}
-		logger.Infow("Confirmed installer set deletion", "name", existingInstallerSet)
 		return nil
+	}
 
-	} else {
-		// If target namespace and version are not changed then check if spec
-		// of TektonResult is changed by checking hash stored as annotation on
-		// TektonInstallerSet with computing new hash of TektonResult Spec
-		logger.Debug("Checking for spec changes in TektonResult")
-		// Hash of TektonResult Spec including platform-specific data (e.g., TLS config)
+	// ponytail: version change or spec change — update in place
+	{
+		needsUpdate := false
+
 		hashInput := struct {
 			Spec      v1alpha1.TektonResultSpec
 			ExtraData string
@@ -352,41 +341,49 @@ func (r *Reconciler) ReconcileKind(ctx context.Context, tr *v1alpha1.TektonResul
 			return err
 		}
 
-		// spec hash stored on installerSet
 		lastAppliedHash := installedTIS.GetAnnotations()[v1alpha1.LastAppliedHashKey]
+
+		if installerSetReleaseVersion != r.operatorVersion {
+			logger.Infow("Version changed, updating installer set in place",
+				"name", installedTIS.Name,
+				"currentVersion", installerSetReleaseVersion,
+				"expectedVersion", r.operatorVersion)
+			labels := installedTIS.GetLabels()
+			labels[v1alpha1.ReleaseVersionKey] = r.operatorVersion
+			installedTIS.SetLabels(labels)
+			needsUpdate = true
+		}
 
 		if lastAppliedHash != expectedSpecHash {
 			logger.Infow("TektonResult spec changed, updating installer set",
 				"previousHash", lastAppliedHash,
 				"newHash", expectedSpecHash)
+			needsUpdate = true
+		}
 
+		if needsUpdate {
 			if err := r.transform(ctx, &manifest, tr); err != nil {
 				logger.Errorw("Manifest transformation failed", "error", err)
 				return err
 			}
 
-			// Update the spec hash
 			current := installedTIS.GetAnnotations()
+			if current == nil {
+				current = map[string]string{}
+			}
 			current[v1alpha1.LastAppliedHashKey] = expectedSpecHash
 			installedTIS.SetAnnotations(current)
 
-			// Update the manifests
 			installedTIS.Spec.Manifests = manifest.Resources()
-			updatedIS, err := r.operatorClientSet.OperatorV1alpha1().TektonInstallerSets().
-				Update(ctx, installedTIS, metav1.UpdateOptions{})
-			if err != nil {
+			if _, err = r.operatorClientSet.OperatorV1alpha1().TektonInstallerSets().
+				Update(ctx, installedTIS, metav1.UpdateOptions{}); err != nil {
 				logger.Errorw("Failed to update installer set", "name", installedTIS.Name, "error", err)
 				return err
 			}
-			logger.Infow("Successfully updated installer set with new spec",
-				"name", updatedIS.Name,
-				"newHash", expectedSpecHash)
-			// after updating installer set enqueue after a duration
-			// to allow changes to get deployed
+			logger.Infow("Successfully updated installer set", "name", installedTIS.Name)
 			return v1alpha1.REQUEUE_EVENT_AFTER
-		} else {
-			logger.Debugw("No changes detected in TektonResult spec", "hash", expectedSpecHash)
 		}
+		logger.Debugw("No changes detected in TektonResult spec", "hash", expectedSpecHash)
 	}
 
 	r.updateTektonResultsStatus(ctx, tr, installedTIS)

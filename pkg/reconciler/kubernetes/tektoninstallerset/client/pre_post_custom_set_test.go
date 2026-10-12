@@ -94,10 +94,11 @@ func TestInstallerSetClient_PreSet_Upgrade_Update(t *testing.T) {
 	fakeClient := fake2.NewFakeISClient(existingIS)
 	client := NewInstallerSetClient(fakeClient, "releaseVersion", "test-version", v1alpha1.KindTektonTrigger, &testMetrics{})
 
+	// ponytail: with in-place upgrades, version mismatch triggers update, not delete+recreate
 	err = client.PreSet(ctx, comp, &manifest, filterAndTransform(nil))
 	assert.Equal(t, err, v1alpha1.REQUEUE_EVENT_AFTER)
 
-	// in further reconciliation new installer set should get created
+	// in further reconciliation the updated installer set should be found
 	err = client.PreSet(ctx, comp, &manifest, filterAndTransform(nil))
 	assert.Equal(t, err, v1alpha1.REQUEUE_EVENT_AFTER)
 
@@ -105,7 +106,8 @@ func TestInstallerSetClient_PreSet_Upgrade_Update(t *testing.T) {
 	assert.NilError(t, err)
 
 	assert.Assert(t, len(list.Items) != 0)
-	assert.Assert(t, list.Items[0].GetName() != oldSetName)
+	assert.Equal(t, list.Items[0].GetName(), oldSetName)
+	assert.Equal(t, list.Items[0].GetLabels()[v1alpha1.ReleaseVersionKey], "releaseVersion")
 
 	// set installer sets as false
 	for _, s := range list.Items {
